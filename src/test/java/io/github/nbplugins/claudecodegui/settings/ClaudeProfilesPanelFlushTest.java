@@ -155,9 +155,8 @@ class ClaudeProfilesPanelFlushTest {
 
         invoke(panel, "flushFormToCurrentProfile");
 
-        assertTrue(work.isOpenaiSubscription());
-        assertFalse(work.isOpenaiProxy());
-        assertEquals("", work.getApiKey());
+        assertEquals(ClaudeProfile.ConnectionType.OPENAI_SUBSCRIPTION, work.getConnectionType());
+                assertEquals("", work.getApiKey());
         assertEquals("", work.getBaseUrl());
         assertEquals("", work.getToken());
     }
@@ -190,7 +189,7 @@ class ClaudeProfilesPanelFlushTest {
     @Test
     void flush_switchingAwayFromChatgptSubscription_clearsFlag() throws Exception {
         ClaudeProfile work = ClaudeProfile.createNamed("Work");
-        work.setOpenaiSubscription(true);
+        work.setConnectionType(ClaudeProfile.ConnectionType.OPENAI_SUBSCRIPTION);
         work.setChatgptAccessToken("access");
         work.setChatgptRefreshToken("refresh");
 
@@ -204,7 +203,7 @@ class ClaudeProfilesPanelFlushTest {
 
         invoke(panel, "flushFormToCurrentProfile");
 
-        assertFalse(work.isOpenaiSubscription());
+        assertNotEquals(ClaudeProfile.ConnectionType.OPENAI_SUBSCRIPTION, work.getConnectionType());
         // Switching connection type does not sign the user out — chatgpt* tokens
         // are only cleared explicitly via the "Sign out" button.
         assertTrue(work.isSignedIntoChatgpt());
@@ -247,5 +246,39 @@ class ClaudeProfilesPanelFlushTest {
         Method m = obj.getClass().getDeclaredMethod(name, paramType);
         m.setAccessible(true);
         m.invoke(obj, arg);
+    }
+
+    /** Copy Profile must keep the explicitly selected connection type (PR #194 review). */
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(ClaudeProfile.ConnectionType.class)
+    void copyOf_preservesConnectionType(ClaudeProfile.ConnectionType type) {
+        ClaudeProfile src = ClaudeProfile.createNamed("Src");
+        src.setConnectionType(type); // no credentials: not inferable from the fields
+
+        ClaudeProfile copy = ClaudeProfilesPanel.copyOf(src, "Copy");
+
+        assertEquals("Copy", copy.getName());
+        assertEquals(type, copy.getConnectionType());
+    }
+
+    /** Copy of a signed-in ChatGPT Subscription profile must stay signed in (PR #194 review). */
+    @org.junit.jupiter.api.Test
+    void copyOf_preservesChatgptAuth() {
+        ClaudeProfile src = ClaudeProfile.createNamed("Src");
+        src.setConnectionType(ClaudeProfile.ConnectionType.OPENAI_SUBSCRIPTION);
+        src.setChatgptAccessToken("access");
+        src.setChatgptRefreshToken("refresh");
+        src.setChatgptAccountId("acc-1");
+        src.setChatgptTokenExpiresAt("2026-10-16T20:00:00Z");
+        src.setChatgptEmail("me@example.com");
+
+        ClaudeProfile copy = ClaudeProfilesPanel.copyOf(src, "Copy");
+
+        assertEquals("access", copy.getChatgptAccessToken());
+        assertEquals("refresh", copy.getChatgptRefreshToken());
+        assertEquals("acc-1", copy.getChatgptAccountId());
+        assertEquals("2026-10-16T20:00:00Z", copy.getChatgptTokenExpiresAt());
+        assertEquals("me@example.com", copy.getChatgptEmail());
+        assertTrue(copy.isSignedIntoChatgpt());
     }
 }
