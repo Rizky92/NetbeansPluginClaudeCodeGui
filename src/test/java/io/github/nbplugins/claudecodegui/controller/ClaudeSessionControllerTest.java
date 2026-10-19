@@ -977,6 +977,143 @@ class ClaudeSessionControllerTest {
         assertEquals(5, (int) tabsSent.get(), "5 tabs must have been sent");
     }
 
+    /**
+     * Regression: selecting a second mode while a Shift+Tab switch is still running
+     * started a second worker thread. Both sent Shift+Tabs concurrently, each steering
+     * toward its own target, so the mode kept cycling and landed on an arbitrary mode.
+     * A new request must instead be picked up by the single running worker.
+     */
+    @Test
+    void onEditModeComboChanged_secondRequestDuringSwitch_isHandledBySameWorker() throws Exception {
+        // Simulated CC cycle (2.1.x order): DEFAULT → ACCEPT_EDITS → PLAN → AUTO → DEFAULT
+        EditMode[] cycle = {EditMode.DEFAULT, EditMode.ACCEPT_EDITS, EditMode.PLAN, EditMode.AUTO};
+        java.util.concurrent.atomic.AtomicInteger ccMode = new java.util.concurrent.atomic.AtomicInteger(0);
+        java.util.Set<Thread> senders = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        java.util.concurrent.CountDownLatch secondIssued = new java.util.concurrent.CountDownLatch(1);
+        ClaudeSessionModel m = new ClaudeSessionModel();
+        m.setEditMode(EditMode.DEFAULT);
+        ClaudeSessionController c = new ClaudeSessionController(m, Collections::emptyList) {
+            @Override boolean isConnected() { return true; }
+            @Override Optional<EditMode> detectCurrentMode() { return Optional.of(cycle[ccMode.get()]); }
+            @Override void sendOneShiftTab() {
+                senders.add(Thread.currentThread());
+                // hold worker 1 until the second request is issued, so the test is deterministic
+                try { secondIssued.await(2, java.util.concurrent.TimeUnit.SECONDS); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                ccMode.updateAndGet(i -> (i + 1) % cycle.length);
+            }
+        };
+        setModeSwitchPollMs(c, 1);
+
+        c.onEditModeComboChanged(EditMode.AUTO);
+        c.onEditModeComboChanged(EditMode.PLAN);
+        secondIssued.countDown();
+
+        java.lang.reflect.Field inProgress = ClaudeSessionController.class.getDeclaredField("modeSwitchInProgress");
+        inProgress.setAccessible(true);
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (inProgress.getBoolean(c) && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5);
+        }
+
+        assertFalse(inProgress.getBoolean(c), "switch must finish");
+        assertEquals(EditMode.PLAN, cycle[ccMode.get()], "must end on the most recently requested mode");
+        assertEquals(1, senders.size(), "Shift+Tabs must be sent by a single worker thread");
+    }
+
+    /**
+     * Regression: an unchecked exception in the Shift+Tab worker (e.g. NPE when the
+     * connector is gone after the session stopped) left the switch target set and
+     * {@code modeSwitchInProgress} true forever, so no later switch ever ran and the
+     * screen-to-model mode sync stayed disabled.
+     */
+    @Test
+    void onEditModeComboChanged_uncheckedExceptionInWorker_doesNotBlockLaterSwitches() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        ClaudeSessionModel m = new ClaudeSessionModel();
+        m.setEditMode(EditMode.DEFAULT);
+        ClaudeSessionController c = new ClaudeSessionController(m, Collections::emptyList) {
+            @Override boolean isConnected() { return true; }
+            @Override Optional<EditMode> detectCurrentMode() { return Optional.of(EditMode.DEFAULT); }
+            @Override void sendOneShiftTab() {
+                if (calls.incrementAndGet() == 1) throw new NullPointerException("connector gone");
+            }
+        };
+        setModeSwitchPollMs(c, 1);
+        java.lang.reflect.Field inProgress = ClaudeSessionController.class.getDeclaredField("modeSwitchInProgress");
+        inProgress.setAccessible(true);
+
+        c.onEditModeComboChanged(EditMode.PLAN);
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (calls.get() < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5);
+        Thread.sleep(200);
+        assertFalse(inProgress.getBoolean(c), "flag must be cleared after the worker failed");
+
+        c.onEditModeComboChanged(EditMode.ACCEPT_EDITS); // model already holds PLAN, so pick another mode
+        deadline = System.currentTimeMillis() + 5_000;
+        while (calls.get() < 2 && System.currentTimeMillis() < deadline) Thread.sleep(5);
+        assertTrue(calls.get() >= 2, "a new worker must start after the failed one");
+    }
+
+    @Test
+    void onEditModeComboChanged_failureOfActiveSwitch_stillServesQueuedRetarget() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.CountDownLatch secondIssued = new java.util.concurrent.CountDownLatch(1);
+        ClaudeSessionModel m = new ClaudeSessionModel();
+        m.setEditMode(EditMode.DEFAULT);
+        ClaudeSessionController c = new ClaudeSessionController(m, Collections::emptyList) {
+            @Override boolean isConnected() { return true; }
+            @Override Optional<EditMode> detectCurrentMode() { return Optional.of(EditMode.DEFAULT); }
+            @Override void sendOneShiftTab() throws java.io.IOException {
+                if (calls.incrementAndGet() == 1) {
+                    try { secondIssued.await(2, java.util.concurrent.TimeUnit.SECONDS); }
+                    catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                    throw new java.io.IOException("write failed");
+                }
+            }
+        };
+        setModeSwitchPollMs(c, 1);
+
+        c.onEditModeComboChanged(EditMode.PLAN);
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (calls.get() < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5);
+        c.onEditModeComboChanged(EditMode.ACCEPT_EDITS); // queued while PLAN switch is active
+        secondIssued.countDown();
+        deadline = System.currentTimeMillis() + 5_000;
+        while (calls.get() < 2 && System.currentTimeMillis() < deadline) Thread.sleep(5);
+        assertTrue(calls.get() >= 2, "queued retarget must be served after the active switch failed");
+    }
+
+    @Test
+    void onEditModeComboChanged_sameModeRequestedAgainDuringFailingSwitch_isStillServed() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.CountDownLatch requestsIssued = new java.util.concurrent.CountDownLatch(1);
+        ClaudeSessionModel m = new ClaudeSessionModel();
+        m.setEditMode(EditMode.DEFAULT);
+        ClaudeSessionController c = new ClaudeSessionController(m, Collections::emptyList) {
+            @Override boolean isConnected() { return true; }
+            @Override Optional<EditMode> detectCurrentMode() { return Optional.of(EditMode.DEFAULT); }
+            @Override void sendOneShiftTab() throws java.io.IOException {
+                if (calls.incrementAndGet() == 1) {
+                    try { requestsIssued.await(2, java.util.concurrent.TimeUnit.SECONDS); }
+                    catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                    throw new java.io.IOException("write failed");
+                }
+            }
+        };
+        setModeSwitchPollMs(c, 1);
+
+        c.onEditModeComboChanged(EditMode.PLAN);   // A, fails
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (calls.get() < 1 && System.currentTimeMillis() < deadline) Thread.sleep(5);
+        c.onEditModeComboChanged(EditMode.ACCEPT_EDITS); // B
+        c.onEditModeComboChanged(EditMode.PLAN);         // A again: slot equals the failed target
+        requestsIssued.countDown();
+        deadline = System.currentTimeMillis() + 5_000;
+        while (calls.get() < 2 && System.currentTimeMillis() < deadline) Thread.sleep(5);
+        assertTrue(calls.get() >= 2, "the latest request must be served even if it equals the failed target");
+    }
+
     private static void setModeSwitchPollMs(ClaudeSessionController c, int ms) throws Exception {
         java.lang.reflect.Field f = ClaudeSessionController.class.getDeclaredField("modeSwitchPollMs");
         f.setAccessible(true);
