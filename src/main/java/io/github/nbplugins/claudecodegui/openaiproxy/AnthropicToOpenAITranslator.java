@@ -19,7 +19,9 @@ import java.util.Map;
  *
  * <h2>Request (Anthropic → OpenAI)</h2>
  * <ul>
- *   <li>{@code system} field → prepended as {@code {"role":"system",...}} message</li>
+ *   <li>{@code system} field → prepended as {@code {"role":"system",...}} message;
+ *       mid-conversation {@code role:"system"} messages are merged into it or turned into
+ *       {@code <system-reminder>} user text (strict templates require system first)</li>
  *   <li>User text content blocks → flattened to string</li>
  *   <li>User tool_result blocks → converted to {@code role:"tool"} messages</li>
  *   <li>Assistant tool_use blocks → converted to {@code tool_calls}</li>
@@ -263,24 +265,134 @@ public final class AnthropicToOpenAITranslator {
     }
 
     private static void convertMessages(JsonNode anthropicMessages, ArrayNode openaiMessages) {
+        // Standalone user message created from a mid-conversation system message; folded into
+        // the next user message so that two user turns never follow each other.
+        ObjectNode pendingReminder = null;
         for (JsonNode msg : anthropicMessages) {
             String role = msg.path("role").asText();
             JsonNode content = msg.path("content");
 
             if ("user".equals(role)) {
                 convertUserMessage(content, openaiMessages);
+                if (pendingReminder != null) {
+                    placePendingReminder(pendingReminder, openaiMessages);
+                }
+                pendingReminder = null;
             } else if ("assistant".equals(role)) {
                 convertAssistantMessage(content, openaiMessages);
+                pendingReminder = null;
             } else if ("system".equals(role)) {
-                // Mid-conversation system message (Claude Code >= 2.1.288, e.g. the
-                // "# Environment" block) — kept in place instead of being dropped.
-                String text = extractSystemText(content);
-                if (!text.isBlank()) {
-                    ObjectNode sysMsg = openaiMessages.addObject();
-                    sysMsg.put("role", "system");
-                    sysMsg.put("content", text);
+                ObjectNode created = addMidConversationSystem(extractSystemText(content), openaiMessages);
+                if (created != null) {
+                    pendingReminder = created;
                 }
             }
+        }
+    }
+
+    /**
+     * Called right after a user turn was converted while {@code carrier} (the user message that
+     * received a mid-conversation system text, possibly a standalone reminder) sits before it.
+     * Folds the following user message into the carrier so two user turns never follow each
+     * other; when the turn produced only {@code tool} messages (answers to the preceding
+     * assistant {@code tool_calls}), moves a standalone reminder after them so the
+     * call/result pair stays adjacent.
+     */
+    private static void placePendingReminder(ObjectNode carrier, ArrayNode out) {
+        int idx = -1;
+        for (int i = out.size() - 1; i >= 0; i--) {
+            if (out.get(i) == carrier) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0 || idx == out.size() - 1) return;
+
+        JsonNode last = out.get(out.size() - 1);
+        if (idx == out.size() - 2 && "user".equals(last.path("role").asText())) {
+            appendUserContent(carrier, (ObjectNode) last);
+            out.remove(out.size() - 1);
+            return;
+        }
+        boolean afterToolCalls = idx > 0 && out.get(idx - 1).has("tool_calls");
+        if (!afterToolCalls) return;
+        for (int i = idx + 1; i < out.size(); i++) {
+            if (!"tool".equals(out.get(i).path("role").asText())) return;
+        }
+        out.remove(idx);
+        out.add(carrier);
+    }
+
+    /** Appends the content of user message {@code next} to user message {@code target}. */
+    private static void appendUserContent(ObjectNode target, ObjectNode next) {
+        JsonNode a = target.path("content");
+        JsonNode b = next.path("content");
+        if (a.isTextual() && b.isTextual()) {
+            target.put("content", a.asText() + "\n\n" + b.asText());
+            return;
+        }
+        ArrayNode parts = MAPPER.createArrayNode();
+        for (JsonNode side : new JsonNode[] {a, b}) {
+            if (side.isArray()) {
+                parts.addAll((ArrayNode) side);
+            } else {
+                ObjectNode part = parts.addObject();
+                part.put("type", "text");
+                part.put("text", side.asText());
+            }
+        }
+        target.set("content", parts);
+    }
+
+    /**
+     * Adds a mid-conversation system message (Claude Code &ge; 2.1.288, e.g. the
+     * "# Environment" block). Chat Completions providers with strict chat templates (vLLM)
+     * reject a {@code system} message that is not at the very beginning, so it is never
+     * emitted in place: before any other message it is merged into the leading system
+     * message; later it becomes a {@code <system-reminder>} block in a user message
+     * (appended to the preceding user message, as text or an extra text part, when there is one).
+     */
+    private static ObjectNode addMidConversationSystem(String text, ArrayNode out) {
+        if (text.isBlank()) return null;
+
+        boolean onlySystemSoFar = true;
+        for (JsonNode m : out) {
+            if (!"system".equals(m.path("role").asText())) {
+                onlySystemSoFar = false;
+                break;
+            }
+        }
+        if (onlySystemSoFar) {
+            if (out.isEmpty()) {
+                ObjectNode sysMsg = out.addObject();
+                sysMsg.put("role", "system");
+                sysMsg.put("content", text);
+                return null;
+            }
+            ObjectNode lead = (ObjectNode) out.get(0);
+            if (lead.path("content").isTextual()) {
+                lead.put("content", lead.path("content").asText() + "\n\n" + text);
+                return null;
+            }
+            // content-part array (explicit cache breakpoint): leave it intact, use a user message
+        }
+
+        String reminder = "<system-reminder>\n" + text + "\n</system-reminder>";
+        JsonNode last = out.isEmpty() ? null : out.get(out.size() - 1);
+        if (last != null && "user".equals(last.path("role").asText()) && last.path("content").isTextual()) {
+            ((ObjectNode) last).put("content", last.path("content").asText() + "\n\n" + reminder);
+            return (ObjectNode) last;
+        } else if (last != null && "user".equals(last.path("role").asText()) && last.path("content").isArray()) {
+            // multipart (image) user turn: add a text part instead of a second consecutive user turn
+            ObjectNode part = ((ArrayNode) last.path("content")).addObject();
+            part.put("type", "text");
+            part.put("text", reminder);
+            return (ObjectNode) last;
+        } else {
+            ObjectNode userMsg = out.addObject();
+            userMsg.put("role", "user");
+            userMsg.put("content", reminder);
+            return userMsg;
         }
     }
 
