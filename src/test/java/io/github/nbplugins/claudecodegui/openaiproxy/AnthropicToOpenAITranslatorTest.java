@@ -46,19 +46,187 @@ class AnthropicToOpenAITranslatorTest {
     }
 
     @Test
-    void translateRequest_midConversationSystemMessage_keptInPlaceAsSystemMessage() throws Exception {
+    void translateRequest_midConversationSystemMessage_becomesSystemReminderInUserMessage() throws Exception {
         ObjectNode result = AnthropicToOpenAITranslator.translateRequest(load("req_mid_conversation_system.json"));
 
         JsonNode messages = result.path("messages");
-        assertEquals(5, messages.size());
+        assertEquals(4, messages.size());
         assertEquals("system", messages.get(0).path("role").asText());
         assertEquals("You are helpful.", messages.get(0).path("content").asText());
         assertEquals("user", messages.get(1).path("role").asText());
-        assertEquals("system", messages.get(2).path("role").asText());
-        assertEquals("# Environment\nWorking directory: /tmp/x", messages.get(2).path("content").asText());
-        assertEquals("assistant", messages.get(3).path("role").asText());
-        assertEquals("system", messages.get(4).path("role").asText());
-        assertEquals("Reminder A\n\nReminder B", messages.get(4).path("content").asText());
+        assertEquals("Hello\n\n<system-reminder>\n# Environment\nWorking directory: /tmp/x\n</system-reminder>",
+                messages.get(1).path("content").asText());
+        assertEquals("assistant", messages.get(2).path("role").asText());
+        assertEquals("user", messages.get(3).path("role").asText());
+        assertEquals("<system-reminder>\nReminder A\n\nReminder B\n</system-reminder>",
+                messages.get(3).path("content").asText());
+        assertOnlyLeadingSystem(messages);
+    }
+
+    @Test
+    void translateRequest_leadingMidConversationSystemMessage_mergedIntoLeadingSystemMessage() throws Exception {
+        JsonNode req = AnthropicToOpenAITranslator.MAPPER.readTree(
+                "{\"model\":\"m\",\"system\":\"Base\",\"messages\":["
+                + "{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"Env\"}]},"
+                + "{\"role\":\"user\",\"content\":\"Hi\"}]}");
+
+        JsonNode messages = AnthropicToOpenAITranslator.translateRequest(req).path("messages");
+
+        assertEquals(2, messages.size());
+        assertEquals("system", messages.get(0).path("role").asText());
+        assertEquals("Base\n\nEnv", messages.get(0).path("content").asText());
+        assertEquals("user", messages.get(1).path("role").asText());
+        assertOnlyLeadingSystem(messages);
+    }
+
+    @Test
+    void translateRequest_trailingMidConversationSystemMessage_requestEndsWithUserTurn() throws Exception {
+        JsonNode req = AnthropicToOpenAITranslator.MAPPER.readTree(
+                "{\"model\":\"m\",\"system\":\"Base\",\"messages\":["
+                + "{\"role\":\"user\",\"content\":\"Hi\"},"
+                + "{\"role\":\"system\",\"content\":\"Env\"}]}");
+
+        JsonNode messages = AnthropicToOpenAITranslator.translateRequest(req).path("messages");
+
+        assertEquals(2, messages.size());
+        assertEquals("user", messages.get(1).path("role").asText());
+        assertEquals("Hi\n\n<system-reminder>\nEnv\n</system-reminder>", messages.get(1).path("content").asText());
+        assertOnlyLeadingSystem(messages);
+    }
+
+    @Test
+    void translateRequest_midConversationSystemMessage_keepsExplicitCacheBreakpoint() throws Exception {
+        JsonNode req = AnthropicToOpenAITranslator.MAPPER.readTree(
+                "{\"model\":\"gpt-5.6-terra\",\"system\":\"Base\",\"messages\":["
+                + "{\"role\":\"system\",\"content\":\"Env\"},"
+                + "{\"role\":\"user\",\"content\":\"Hi\"}]}");
+
+        JsonNode messages = AnthropicToOpenAITranslator.translateRequest(req, null, true).path("messages");
+
+        assertEquals("system", messages.get(0).path("role").asText());
+        assertEquals("explicit", messages.get(0).path("content").get(0)
+                .path("prompt_cache_breakpoint").path("mode").asText());
+        assertEquals(1, messages.get(0).path("content").size());
+        assertEquals(2, messages.size());
+        assertEquals("user", messages.get(1).path("role").asText());
+        assertEquals("<system-reminder>\nEnv\n</system-reminder>\n\nHi", messages.get(1).path("content").asText());
+        assertOnlyLeadingSystem(messages);
+    }
+
+    @Test
+    void translateRequest_reminderBeforeImagePrompt_mergedIntoThatUserTurn() throws Exception {
+        JsonNode req = AnthropicToOpenAITranslator.MAPPER.readTree(
+                "{\"model\":\"gpt-5.6-terra\",\"system\":\"Base\",\"messages\":["
+                + "{\"role\":\"system\",\"content\":\"Env\"},"
+                + "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Look\"},"
+                + "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"AAAA\"}}]}]}");
+
+        JsonNode messages = AnthropicToOpenAITranslator.translateRequest(req, null, true).path("messages");
+
+        assertEquals(2, messages.size());
+        JsonNode parts = messages.get(1).path("content");
+        assertTrue(parts.isArray());
+        assertEquals(3, parts.size());
+        assertEquals("<system-reminder>\nEnv\n</system-reminder>", parts.get(0).path("text").asText());
+        assertEquals("Look", parts.get(1).path("text").asText());
+        assertEquals("image_url", parts.get(2).path("type").asText());
+    }
+
+    @Test
+    void translateRequest_reminderFollowedByAssistant_staysStandaloneUserMessage() throws Exception {
+        JsonNode req = AnthropicToOpenAITranslator.MAPPER.readTree(
+                "{\"model\":\"gpt-5.6-terra\",\"system\":\"Base\",\"messages\":["
+                + "{\"role\":\"system\",\"content\":\"Env\"},"
+                + "{\"role\":\"assistant\",\"content\":\"Hi\"}]}");
+
+        JsonNode messages = AnthropicToOpenAITranslator.translateRequest(req, null, true).path("messages");
+
+        assertEquals(3, messages.size());
+        assertEquals("user", messages.get(1).path("role").asText());
+        assertEquals("assistant", messages.get(2).path("role").asText());
+    }
+
+    @Test
+    void translateRequest_midConversationSystemMessage_afterImagePrompt_staysInSameUserTurn() throws Exception {
+        JsonNode req = AnthropicToOpenAITranslator.MAPPER.readTree(
+                "{\"model\":\"m\",\"messages\":["
+                + "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Look\"},"
+                + "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"AAAA\"}}]},"
+                + "{\"role\":\"system\",\"content\":\"Env\"}]}");
+
+        JsonNode messages = AnthropicToOpenAITranslator.translateRequest(req).path("messages");
+
+        assertEquals(1, messages.size());
+        JsonNode parts = messages.get(0).path("content");
+        assertTrue(parts.isArray());
+        assertEquals(3, parts.size());
+        assertEquals("image_url", parts.get(1).path("type").asText());
+        assertEquals("text", parts.get(2).path("type").asText());
+        assertEquals("<system-reminder>\nEnv\n</system-reminder>", parts.get(2).path("text").asText());
+    }
+
+    @Test
+    void translateRequest_reminderBetweenToolUseAndToolResult_movedAfterToolMessages() throws Exception {
+        JsonNode req = AnthropicToOpenAITranslator.MAPPER.readTree(
+                "{\"model\":\"m\",\"system\":\"Base\",\"messages\":["
+                + "{\"role\":\"user\",\"content\":\"Hi\"},"
+                + "{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Read\",\"input\":{}}]},"
+                + "{\"role\":\"system\",\"content\":\"Env\"},"
+                + "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"ok\"}]}]}");
+
+        JsonNode messages = AnthropicToOpenAITranslator.translateRequest(req).path("messages");
+
+        assertEquals(5, messages.size());
+        assertEquals("assistant", messages.get(2).path("role").asText());
+        assertTrue(messages.get(2).has("tool_calls"));
+        assertEquals("tool", messages.get(3).path("role").asText());
+        assertEquals("t1", messages.get(3).path("tool_call_id").asText());
+        assertEquals("user", messages.get(4).path("role").asText());
+        assertEquals("<system-reminder>\nEnv\n</system-reminder>", messages.get(4).path("content").asText());
+        assertOnlyLeadingSystem(messages);
+    }
+
+    @Test
+    void translateRequest_reminderBetweenTwoUserTurns_coalescedIntoOneUserTurn() throws Exception {
+        JsonNode req = AnthropicToOpenAITranslator.MAPPER.readTree(
+                "{\"model\":\"m\",\"system\":\"Base\",\"messages\":["
+                + "{\"role\":\"user\",\"content\":\"A\"},"
+                + "{\"role\":\"system\",\"content\":\"S\"},"
+                + "{\"role\":\"user\",\"content\":\"B\"}]}");
+
+        JsonNode messages = AnthropicToOpenAITranslator.translateRequest(req).path("messages");
+
+        assertEquals(2, messages.size());
+        assertEquals("user", messages.get(1).path("role").asText());
+        assertEquals("A\n\n<system-reminder>\nS\n</system-reminder>\n\nB",
+                messages.get(1).path("content").asText());
+    }
+
+    @Test
+    void translateRequest_reminderBetweenTextAndImageUserTurns_coalescedIntoMultipartTurn() throws Exception {
+        JsonNode req = AnthropicToOpenAITranslator.MAPPER.readTree(
+                "{\"model\":\"m\",\"system\":\"Base\",\"messages\":["
+                + "{\"role\":\"user\",\"content\":\"A\"},"
+                + "{\"role\":\"system\",\"content\":\"S\"},"
+                + "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Look\"},"
+                + "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"AAAA\"}}]}]}");
+
+        JsonNode messages = AnthropicToOpenAITranslator.translateRequest(req).path("messages");
+
+        assertEquals(2, messages.size());
+        JsonNode parts = messages.get(1).path("content");
+        assertTrue(parts.isArray());
+        assertEquals(3, parts.size());
+        assertEquals("A\n\n<system-reminder>\nS\n</system-reminder>", parts.get(0).path("text").asText());
+        assertEquals("Look", parts.get(1).path("text").asText());
+        assertEquals("image_url", parts.get(2).path("type").asText());
+    }
+
+    private static void assertOnlyLeadingSystem(JsonNode messages) {
+        for (int i = 1; i < messages.size(); i++) {
+            assertNotEquals("system", messages.get(i).path("role").asText(),
+                    "system message at index " + i + " must not follow other messages");
+        }
     }
 
     @Test

@@ -113,6 +113,18 @@ public class ClaudeSessionController {
     /** {@code true} while a shift-tab thread is actively switching the CC edit mode. */
     private volatile boolean modeSwitchInProgress = false;
 
+    /** Guards {@link #editModeSwitchTarget}. */
+    private final Object editModeSwitchLock = new Object();
+
+    /**
+     * Mode the running {@link #sendShiftTabsUntilMode} worker is steering toward;
+     * {@code null} when no worker runs. Guarded by {@link #editModeSwitchLock}.
+     */
+    private EditMode editModeSwitchTarget;
+
+    /** Incremented on every switch request; tells a newer request from an equal one. Guarded by the lock. */
+    private long editModeSwitchGeneration;
+
     /** Poll interval (ms) per read attempt inside {@link #trySendShiftTabsUntilMode}; 1 in tests. */
     int modeSwitchPollMs = 100;
     /**
@@ -759,7 +771,10 @@ public class ClaudeSessionController {
             } catch (IOException | InterruptedException ex) {
                 LOG.warning("sendShiftTab failed: " + ex.getMessage());
             } finally {
-                modeSwitchInProgress = false;
+                // a running sendShiftTabsUntilMode worker owns the flag
+                synchronized (editModeSwitchLock) {
+                    if (editModeSwitchTarget == null) modeSwitchInProgress = false;
+                }
             }
         }, "shift-tab");
         t.setDaemon(true);
@@ -791,34 +806,75 @@ public class ClaudeSessionController {
      * {@link EditMode#BYPASS_PERMISSIONS} if available, then {@link EditMode#ACCEPT_EDITS}.
      *
      * <p>Runs on a daemon thread; sets lifecycle to WORKING at start and
-     * READY on completion.
+     * READY on completion. At most one worker runs at a time: a request made while
+     * a switch is in progress only replaces its target, and the running worker
+     * continues to the new target once the current one is handled. (Two concurrent
+     * workers would each press Shift+Tab toward their own target, cycling endlessly.)
      *
      * @param targetMode the edit mode to reach
      */
     private void sendShiftTabsUntilMode(EditMode targetMode) {
-        if (connector == null) return;
+        if (!isConnected()) return;
+        final long startGeneration;
+        synchronized (editModeSwitchLock) {
+            boolean running = editModeSwitchTarget != null;
+            editModeSwitchTarget = targetMode;
+            startGeneration = ++editModeSwitchGeneration;
+            if (running) {
+                LOG.fine("sendShiftTabsUntilMode: switch in progress, retargeting to " + targetMode);
+                return;
+            }
+            modeSwitchInProgress = true;
+        }
         model.setLifecycle(SessionLifecycle.WORKING);
-        modeSwitchInProgress = true;
         Thread t = new Thread(() -> {
+            EditMode target = targetMode;
+            long generation = startGeneration;
             try {
-                LOG.fine("sendShiftTabsUntilMode: target=" + targetMode
-                        + " currentModel=" + model.getEditMode());
-                if (trySendShiftTabsUntilMode(targetMode)) return;
-                // AUTO mode not found — older CC doesn't support it; try fallbacks
-                if (targetMode == EditMode.AUTO) {
-                    LOG.warning("sendShiftTabsUntilMode: auto mode not available, trying fallbacks");
-                    if (trySendShiftTabsUntilMode(EditMode.BYPASS_PERMISSIONS)) return;
-                    trySendShiftTabsUntilMode(EditMode.ACCEPT_EDITS);
+                while (target != null) {
+                    try {
+                        switchEditMode(target);
+                    } catch (IOException | RuntimeException ex) {
+                        // a failed switch must not drop a newer request queued meanwhile
+                        LOG.warning("sendShiftTabsUntilMode failed: " + ex.getMessage());
+                    }
+                    synchronized (editModeSwitchLock) {
+                        if (editModeSwitchGeneration == generation) {
+                            editModeSwitchTarget = null;
+                            modeSwitchInProgress = false;
+                        }
+                        target = editModeSwitchTarget;
+                        generation = editModeSwitchGeneration;
+                    }
                 }
-            } catch (IOException | InterruptedException ex) {
-                LOG.warning("sendShiftTabsUntilMode failed: " + ex.getMessage());
+            } catch (InterruptedException ex) {
+                LOG.warning("sendShiftTabsUntilMode interrupted");
+                synchronized (editModeSwitchLock) {
+                    editModeSwitchTarget = null;
+                    modeSwitchInProgress = false;
+                }
             } finally {
-                modeSwitchInProgress = false;
                 onClaudeIdle();
             }
         }, "shift-tab-edit-mode");
         t.setDaemon(true);
         t.start();
+    }
+
+    /**
+     * Presses Shift+Tab until {@code targetMode} is reached; for {@link EditMode#AUTO}
+     * falls back to {@link EditMode#BYPASS_PERMISSIONS}, then {@link EditMode#ACCEPT_EDITS}.
+     */
+    private void switchEditMode(EditMode targetMode) throws IOException, InterruptedException {
+        LOG.fine("sendShiftTabsUntilMode: target=" + targetMode
+                + " currentModel=" + model.getEditMode());
+        if (trySendShiftTabsUntilMode(targetMode)) return;
+        // AUTO mode not found — older CC doesn't support it; try fallbacks
+        if (targetMode == EditMode.AUTO) {
+            LOG.warning("sendShiftTabsUntilMode: auto mode not available, trying fallbacks");
+            if (trySendShiftTabsUntilMode(EditMode.BYPASS_PERMISSIONS)) return;
+            trySendShiftTabsUntilMode(EditMode.ACCEPT_EDITS);
+        }
     }
 
     /**
@@ -906,6 +962,11 @@ public class ClaudeSessionController {
     /** Package-private for testing: reads the current edit mode from the terminal screen. */
     Optional<EditMode> detectCurrentMode() {
         return screenContentDetector.detectEditMode(screenLines.get());
+    }
+
+    /** Package-private for testing: whether a PTY connector is active. */
+    boolean isConnected() {
+        return connector != null;
     }
 
     /** Package-private for testing: sends one Shift+Tab (ESC [ Z) to the PTY. */
