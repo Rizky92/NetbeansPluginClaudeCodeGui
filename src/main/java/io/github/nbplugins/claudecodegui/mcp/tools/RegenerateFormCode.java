@@ -69,6 +69,9 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
 
     private static final Pattern WHITESPACE = Pattern.compile("\\s+");
 
+    /** The form module's data object of a {@code .java} / {@code .form} pair. */
+    private static final String FORM_DATA_OBJECT = "org.netbeans.modules.form.FormDataObject";
+
     /** Guarded header of an event handler method, capturing the handler name. */
     private static final Pattern EVENT_HANDLER_HEADER = Pattern.compile("//GEN-FIRST:event_([\\w$]+)");
 
@@ -247,6 +250,8 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
             throw new IllegalStateException(javaName + " is not recognized by NetBeans as a GUI Builder form "
                     + "(is the Swing GUI Builder / form module enabled?)");
         }
+        // An unsupported NetBeans version fails here, before the form is touched.
+        FormEditorApi api = FormEditorApi.resolve(editorSupport.getClass());
         if (dataObject.isModified()) {
             throw new IllegalStateException(javaName + " has unsaved changes in the IDE. "
                     + "Save them (saveDocument) or ask the user to revert them, then call regenerate_form_code again.");
@@ -254,7 +259,7 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
         waitForDocumentInSync(dataObject.getLookup().lookup(EditorCookie.class), javaFo, javaName);
 
         Set<String> existingHandlers = existingEventHandlers(javaText);
-        Outcome outcome = onEdt(() -> regenerateInFormEditor(editorSupport, javaName, formName, existingHandlers));
+        Outcome outcome = onEdt(() -> regenerateInFormEditor(api, editorSupport, javaName, formName, existingHandlers));
         String designerNote = outcome.designerOpen()
                 ? " The open GUI Builder was reloaded from the edited .form." : "";
         if (!outcome.codeChanged()) {
@@ -284,10 +289,10 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
      * file ({@code FormEditor.saveFormData()}) and may report saving errors in dialogs.
      * Validation and waiting for the editor are done by the caller, off the EDT.
      *
-     * <p>All form module methods are resolved before the first one is called (see
-     * {@link FormEditorApi}). A form loaded only for the regeneration (designer closed)
-     * is always closed again, also when the regeneration fails.
+     * <p>A form loaded only for the regeneration (designer closed) is always closed again,
+     * also when the regeneration fails.
      *
+     * @param api              the form module methods, resolved by the caller before the form is touched
      * @param editorSupport    the form module's {@code FormEditorSupport}
      * @param javaName         name of the {@code .java} file, for messages
      * @param formName         name of the {@code .form} file, for messages
@@ -295,9 +300,8 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
      * @return what happened
      * @throws Exception if the form cannot be loaded or the code cannot be regenerated
      */
-    static Outcome regenerateInFormEditor(Object editorSupport, String javaName, String formName,
+    static Outcome regenerateInFormEditor(FormEditorApi api, Object editorSupport, String javaName, String formName,
                                           Set<String> existingHandlers) throws Exception {
-        FormEditorApi api = FormEditorApi.resolve(editorSupport.getClass());
         boolean open = (Boolean) invoke(api.isOpened(), editorSupport);
         Object formEditor;
         if (open) {
@@ -373,18 +377,20 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
     }
 
     /**
-     * The form module methods this tool invokes. They are all resolved, with their
-     * return types checked, before any of them is called, so that an incompatible
-     * NetBeans version fails with "Unsupported NetBeans form editor version" before
-     * the form is touched. The {@code FormEditor}, {@code FormModel}, {@code FormEvents}
-     * and {@code Event} classes are taken from the declared return types of
+     * The form module methods this tool invokes on the form editor support. They are
+     * all resolved, with their return types checked, right after the editor support is
+     * obtained and before any of them is called, so that an incompatible NetBeans
+     * version fails with "Unsupported NetBeans form editor version" before the form is
+     * touched. The {@code FormEditor}, {@code FormModel}, {@code FormEvents} and
+     * {@code Event} classes are taken from the declared return types of
      * {@code getFormEditor()}, {@code getFormModel()}, {@code getFormEvents()} and
      * {@code getEventsForHandler()}.
      *
-     * <p>Verified against NetBeans 31 ({@code org.netbeans.modules.nbform.FormEditorSupport},
-     * {@code org.netbeans.modules.form.FormEditor}, {@code org.netbeans.modules.form.FormModel},
-     * {@code org.netbeans.modules.form.FormEvents}); exercised against the real form editor
-     * of the compile-time NetBeans version by {@code RegenerateFormCodeIT}.
+     * <p>Verified against NetBeans 23 and 31 ({@code org.netbeans.modules.form.FormDataObject},
+     * {@code org.netbeans.modules.nbform.FormEditorSupport}, {@code org.netbeans.modules.form.FormEditor},
+     * {@code FormModel}, {@code FormEvents}, {@code Event}): the method signatures and the
+     * form model's event queuing are the same in both. {@code RegenerateFormCodeIT} runs
+     * the tool against the real form editor of NetBeans 23, the compile-time version.
      */
     record FormEditorApi(Method isOpened, Method loadForm, Method reloadFormEditor, Method getFormEditor,
                          Method getDocument, Method saveDocument,
@@ -458,15 +464,34 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
                 + owner.getName() + "." + methodName + "() " + problem, cause);
     }
 
-    /** Returns the form module's {@code EditorSupport}, or {@code null} for a non-form data object. */
+    /**
+     * Returns the form module's {@code EditorSupport}, or {@code null} for a non-form data
+     * object. {@code FormDataObject.getFormEditorSupport()} only creates the support
+     * object; it does not load the form.
+     *
+     * @throws IllegalStateException if the data object is the form module's
+     *         {@code FormDataObject} but has no {@code getFormEditorSupport()}
+     */
     private static Object formEditorSupport(DataObject dataObject) throws Exception {
         Method getFormEditorSupport;
         try {
             getFormEditorSupport = dataObject.getClass().getMethod("getFormEditorSupport");
         } catch (NoSuchMethodException e) {
+            if (isFormDataObject(dataObject.getClass())) {
+                throw unsupported(dataObject.getClass(), "getFormEditorSupport", "not found", e);
+            }
             return null;
         }
         return invoke(getFormEditorSupport, dataObject);
+    }
+
+    private static boolean isFormDataObject(Class<?> dataObjectClass) {
+        for (Class<?> c = dataObjectClass; c != null; c = c.getSuperclass()) {
+            if (c.getName().equals(FORM_DATA_OBJECT)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

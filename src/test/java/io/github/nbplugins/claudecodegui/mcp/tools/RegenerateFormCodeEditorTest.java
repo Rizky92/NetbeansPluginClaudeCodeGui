@@ -154,11 +154,18 @@ public class RegenerateFormCodeEditorTest {
         }
     }
 
+    /** Resolves the form editor API from the support's runtime class first, as the tool does. */
+    private static RegenerateFormCode.Outcome regenerate(Object support, String javaName, String formName,
+                                                         Set<String> existingHandlers) throws Exception {
+        return RegenerateFormCode.regenerateInFormEditor(RegenerateFormCode.FormEditorApi.resolve(support.getClass()),
+                support, javaName, formName, existingHandlers);
+    }
+
     @Test
     public void designerClosedRegeneratesAndSavesJava() throws Exception {
         FakeEditorSupport support = new FakeEditorSupport(false);
 
-        RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form", Set.of());
+        regenerate(support, "MyFrame.java", "MyFrame.form", Set.of());
 
         assertEquals(NEW_CODE, support.savedJava,
                 "a freshly loaded form is considered up to date - the form must be marked changed "
@@ -171,7 +178,7 @@ public class RegenerateFormCodeEditorTest {
     public void designerOpenReloadsRegeneratesAndSavesJava() throws Exception {
         FakeEditorSupport support = new FakeEditorSupport(true);
 
-        RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form", Set.of());
+        regenerate(support, "MyFrame.java", "MyFrame.form", Set.of());
 
         assertTrue(support.reloaded, "an open designer must be reloaded from the edited .form");
         assertEquals(NEW_CODE, support.savedJava);
@@ -184,7 +191,7 @@ public class RegenerateFormCodeEditorTest {
         FakeEditorSupport support = new FakeEditorSupport(false);
         support.formEditor.model.events.handlers.addAll(List.of("otherNewHandler", "existingHandler", "newHandler"));
 
-        RegenerateFormCode.Outcome outcome = RegenerateFormCode.regenerateInFormEditor(
+        RegenerateFormCode.Outcome outcome = regenerate(
                 support, "MyFrame.java", "MyFrame.form", Set.of("existingHandler"));
 
         assertEquals(List.of("newHandler", "otherNewHandler"), outcome.addedHandlers(), "added sorted by name");
@@ -198,7 +205,7 @@ public class RegenerateFormCodeEditorTest {
         FakeEditorSupport support = new FakeEditorSupport(true);
         support.formEditor.model.events.handlers.add("existingHandler");
 
-        RegenerateFormCode.Outcome outcome = RegenerateFormCode.regenerateInFormEditor(
+        RegenerateFormCode.Outcome outcome = regenerate(
                 support, "MyFrame.java", "MyFrame.form", Set.of("existingHandler"));
 
         assertEquals(List.of(), outcome.addedHandlers());
@@ -211,7 +218,7 @@ public class RegenerateFormCodeEditorTest {
         support.formEditor.generatedCode = OLD_CODE;
 
         RegenerateFormCode.Outcome outcome =
-                RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form", Set.of());
+                regenerate(support, "MyFrame.java", "MyFrame.form", Set.of());
 
         assertFalse(outcome.codeChanged());
         assertEquals(OLD_CODE, outcome.generatedText());
@@ -223,7 +230,7 @@ public class RegenerateFormCodeEditorTest {
         support.formEditor.failRegeneration = true;
 
         IllegalStateException e = assertThrows(IllegalStateException.class,
-                () -> RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form", Set.of()));
+                () -> regenerate(support, "MyFrame.java", "MyFrame.form", Set.of()));
 
         assertEquals("code generation failed", e.getMessage());
         assertTrue(support.formEditor.closed, "a form loaded only for regeneration must be closed even on failure");
@@ -235,7 +242,7 @@ public class RegenerateFormCodeEditorTest {
         support.formEditor.failRegeneration = true;
 
         assertThrows(IllegalStateException.class,
-                () -> RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form", Set.of()));
+                () -> regenerate(support, "MyFrame.java", "MyFrame.form", Set.of()));
 
         assertFalse(support.formEditor.closed, "the user's open designer must not be closed");
     }
@@ -261,7 +268,7 @@ public class RegenerateFormCodeEditorTest {
         IncompatibleEditorSupport support = new IncompatibleEditorSupport();
 
         IllegalStateException e = assertThrows(IllegalStateException.class,
-                () -> RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form", Set.of()));
+                () -> regenerate(support, "MyFrame.java", "MyFrame.form", Set.of()));
 
         assertTrue(e.getMessage().startsWith("Unsupported NetBeans form editor version"), e.getMessage());
         assertTrue(e.getMessage().contains("saveDocument"), e.getMessage());
@@ -277,7 +284,7 @@ public class RegenerateFormCodeEditorTest {
     @Test
     public void nonPublicClassIsReportedAsUnsupportedVersion() {
         IllegalStateException e = assertThrows(IllegalStateException.class,
-                () -> RegenerateFormCode.regenerateInFormEditor(new NonPublicEditorSupport(), "MyFrame.java", "MyFrame.form", Set.of()));
+                () -> regenerate(new NonPublicEditorSupport(), "MyFrame.java", "MyFrame.form", Set.of()));
 
         assertTrue(e.getMessage().startsWith("Unsupported NetBeans form editor version"), e.getMessage());
         assertTrue(e.getMessage().contains("is not accessible"), e.getMessage());
