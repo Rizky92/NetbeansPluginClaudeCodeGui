@@ -10,7 +10,9 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Drives {@link RegenerateFormCode#regenerateInFormEditor} with fakes that expose
  * the same public methods as the NetBeans form module classes and reproduce their
- * behavior (verified against the NetBeans 27 bytecode):
+ * behavior (verified against the NetBeans 31 bytecode). Like the real classes, the
+ * getters declare the concrete form editor / form model types, from which
+ * {@link RegenerateFormCode.FormEditorApi} resolves the methods up front:
  * <ul>
  *   <li>{@code JavaCodeGenerator.codeUpToDate} starts {@code true}, so right after a
  *       form is loaded {@code regenerateCodeIfNeeded()} does nothing;</li>
@@ -51,6 +53,7 @@ public class RegenerateFormCodeEditorTest {
         boolean loaded;
         boolean closed;
         boolean codeUpToDate = true; // JavaCodeGenerator's constructor default
+        boolean failRegeneration;
         String generatedCode = NEW_CODE;
 
         FakeFormEditor(FakeEditorSupport support) {
@@ -60,10 +63,13 @@ public class RegenerateFormCodeEditorTest {
 
         public boolean isFormLoaded() { return loaded; }
         public boolean anyPersistenceError() { return false; }
-        public Object getFormModel() { return model; }
+        public FakeFormModel getFormModel() { return model; }
         public void closeForm() { closed = true; loaded = false; }
 
         public void regenerateCodeIfNeeded() throws BadLocationException {
+            if (failRegeneration) {
+                throw new IllegalStateException("code generation failed");
+            }
             if (!codeUpToDate) {
                 codeUpToDate = true;
                 support.document.remove(0, support.document.getLength());
@@ -90,8 +96,8 @@ public class RegenerateFormCodeEditorTest {
 
         public boolean isOpened() { return formEditor.loaded; }
         public boolean loadForm() { formEditor.loaded = true; return true; }
-        public Object getFormEditor() { return formEditor; }
-        public Object reloadFormEditor() { reloaded = true; formEditor.codeUpToDate = true; return formEditor; }
+        public FakeFormEditor getFormEditor() { return formEditor; }
+        public FakeFormEditor reloadFormEditor() { reloaded = true; formEditor.codeUpToDate = true; return formEditor; }
         public Document getDocument() { return document; }
 
         public void saveSourceOnly() throws BadLocationException {
@@ -140,5 +146,71 @@ public class RegenerateFormCodeEditorTest {
 
         assertFalse(outcome.codeChanged());
         assertEquals(OLD_CODE, outcome.generatedText());
+    }
+
+    @Test
+    public void closesFormLoadedForRegenerationWhenRegenerationFails() throws Exception {
+        FakeEditorSupport support = new FakeEditorSupport(false);
+        support.formEditor.failRegeneration = true;
+
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form"));
+
+        assertEquals("code generation failed", e.getMessage());
+        assertTrue(support.formEditor.closed, "a form loaded only for regeneration must be closed even on failure");
+    }
+
+    @Test
+    public void keepsOpenDesignerOpenWhenRegenerationFails() throws Exception {
+        FakeEditorSupport support = new FakeEditorSupport(true);
+        support.formEditor.failRegeneration = true;
+
+        assertThrows(IllegalStateException.class,
+                () -> RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form"));
+
+        assertFalse(support.formEditor.closed, "the user's open designer must not be closed");
+    }
+
+    /** Fake of a form editor support from an incompatible NetBeans version: {@code saveDocument()} is missing. */
+    public static class IncompatibleEditorSupport {
+        final FakeEditorSupport delegate;
+        boolean touched;
+
+        IncompatibleEditorSupport() throws BadLocationException {
+            delegate = new FakeEditorSupport(false);
+        }
+
+        public boolean isOpened() { touched = true; return false; }
+        public boolean loadForm() { touched = true; return delegate.loadForm(); }
+        public FakeFormEditor getFormEditor() { touched = true; return delegate.formEditor; }
+        public FakeFormEditor reloadFormEditor() { touched = true; return delegate.formEditor; }
+        public Document getDocument() { touched = true; return delegate.document; }
+    }
+
+    @Test
+    public void incompatibleVersionFailsBeforeTouchingTheForm() throws Exception {
+        IncompatibleEditorSupport support = new IncompatibleEditorSupport();
+
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form"));
+
+        assertTrue(e.getMessage().startsWith("Unsupported NetBeans form editor version"), e.getMessage());
+        assertTrue(e.getMessage().contains("saveDocument"), e.getMessage());
+        assertFalse(support.touched, "no form editor method may be called before all are resolved");
+        assertFalse(support.delegate.formEditor.loaded);
+    }
+
+    /** Non-public class: its public methods cannot be invoked reflectively from outside. */
+    static class NonPublicEditorSupport {
+        public FakeFormEditor getFormEditor() { return null; }
+    }
+
+    @Test
+    public void nonPublicClassIsReportedAsUnsupportedVersion() {
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> RegenerateFormCode.regenerateInFormEditor(new NonPublicEditorSupport(), "MyFrame.java", "MyFrame.form"));
+
+        assertTrue(e.getMessage().startsWith("Unsupported NetBeans form editor version"), e.getMessage());
+        assertTrue(e.getMessage().contains("is not accessible"), e.getMessage());
     }
 }

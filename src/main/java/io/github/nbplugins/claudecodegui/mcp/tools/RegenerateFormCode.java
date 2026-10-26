@@ -6,6 +6,7 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
@@ -233,8 +234,18 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
 
     /**
      * Loads (or reloads) the form, regenerates its guarded code and saves it.
-     * Must run on the EDT. Package-private so tests can drive it with fake
-     * form-editor objects that expose the same public methods.
+     * Package-private so tests can drive it with fake form-editor objects that
+     * expose the same public methods.
+     *
+     * <p>Must run on the EDT, including the disk I/O of {@code saveDocument()}: the form
+     * module confines the form model to the EDT and does not switch threads itself -
+     * {@code FormEditorSupport.saveDocument()} serializes the model into the {@code .form}
+     * file ({@code FormEditor.saveFormData()}) and may report saving errors in dialogs.
+     * Validation and waiting for the editor are done by the caller, off the EDT.
+     *
+     * <p>All form module methods are resolved before the first one is called (see
+     * {@link FormEditorApi}). A form loaded only for the regeneration (designer closed)
+     * is always closed again, also when the regeneration fails.
      *
      * @param editorSupport the form module's {@code FormEditorSupport}
      * @param javaName      name of the {@code .java} file, for messages
@@ -243,56 +254,139 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
      * @throws Exception if the form cannot be loaded or the code cannot be regenerated
      */
     static Outcome regenerateInFormEditor(Object editorSupport, String javaName, String formName) throws Exception {
-        boolean open = (Boolean) call(editorSupport, "isOpened");
+        FormEditorApi api = FormEditorApi.resolve(editorSupport.getClass());
+        boolean open = (Boolean) invoke(api.isOpened(), editorSupport);
         Object formEditor;
         if (open) {
-            formEditor = call(editorSupport, "reloadFormEditor");
+            formEditor = invoke(api.reloadFormEditor(), editorSupport);
         } else {
-            call(editorSupport, "loadForm");
-            formEditor = call(editorSupport, "getFormEditor");
+            invoke(api.loadForm(), editorSupport);
+            formEditor = invoke(api.getFormEditor(), editorSupport);
         }
-        if (formEditor == null || !(Boolean) call(formEditor, "isFormLoaded")
-                || (Boolean) call(formEditor, "anyPersistenceError")) {
-            if (!open && formEditor != null) {
-                call(formEditor, "closeForm");
+        if (formEditor == null) {
+            throw formLoadError(formName);
+        }
+        try {
+            if (!(Boolean) invoke(api.isFormLoaded(), formEditor)
+                    || (Boolean) invoke(api.anyPersistenceError(), formEditor)) {
+                throw formLoadError(formName);
             }
-            throw new IllegalStateException("NetBeans could not load " + formName
-                    + " without errors. Check the .form XML, or open the form in the GUI Builder (Design view) to see the errors.");
-        }
-        Object formModel = call(formEditor, "getFormModel");
-        if (formModel == null || (Boolean) call(formModel, "isReadOnly")) {
+            Object formModel = invoke(api.getFormModel(), formEditor);
+            if (formModel == null || (Boolean) invoke(api.isReadOnly(), formModel)) {
+                throw new IllegalStateException(formName + " was loaded read-only (missing or damaged guarded "
+                        + "sections in " + javaName + ", or a read-only file); code was not regenerated.");
+            }
+            Document document = (Document) invoke(api.getDocument(), editorSupport);
+            String before = documentText(document);
+            invoke(api.fireFormChanged(), formModel, true);
+            invoke(api.regenerateCodeIfNeeded(), formEditor);
+            String after = documentText(document);
+            invoke(api.saveDocument(), editorSupport);
+            return new Outcome(open, !before.equals(after), after);
+        } finally {
             if (!open) {
-                call(formEditor, "closeForm");
+                invoke(api.closeForm(), formEditor);
             }
-            throw new IllegalStateException(formName + " was loaded read-only (missing or damaged guarded "
-                    + "sections in " + javaName + ", or a read-only file); code was not regenerated.");
         }
-        Document document = (Document) call(editorSupport, "getDocument");
-        String before = documentText(document);
-        call(formModel, "fireFormChanged", boolean.class, true);
-        call(formEditor, "regenerateCodeIfNeeded");
-        String after = documentText(document);
-        call(editorSupport, "saveDocument");
-        if (!open) {
-            call(formEditor, "closeForm");
+    }
+
+    private static IllegalStateException formLoadError(String formName) {
+        return new IllegalStateException("NetBeans could not load " + formName
+                + " without errors. Check the .form XML, or open the form in the GUI Builder (Design view) to see the errors.");
+    }
+
+    /**
+     * The form module methods this tool invokes. They are all resolved, with their
+     * return types checked, before any of them is called, so that an incompatible
+     * NetBeans version fails with "Unsupported NetBeans form editor version" before
+     * the form is touched. The {@code FormEditor} and {@code FormModel} classes are
+     * taken from the declared return types of {@code getFormEditor()} and
+     * {@code getFormModel()}.
+     *
+     * <p>Verified against NetBeans 31 ({@code org.netbeans.modules.nbform.FormEditorSupport},
+     * {@code org.netbeans.modules.form.FormEditor}, {@code org.netbeans.modules.form.FormModel}).
+     */
+    record FormEditorApi(Method isOpened, Method loadForm, Method reloadFormEditor, Method getFormEditor,
+                         Method getDocument, Method saveDocument,
+                         Method isFormLoaded, Method anyPersistenceError, Method getFormModel,
+                         Method regenerateCodeIfNeeded, Method closeForm,
+                         Method isReadOnly, Method fireFormChanged) {
+
+        /**
+         * Resolves the form module methods starting from the runtime class of the form editor support.
+         *
+         * @param supportClass runtime class of the form module's {@code FormEditorSupport}
+         * @return the resolved methods
+         * @throws IllegalStateException if a method is missing, not accessible or has an unexpected return type
+         */
+        static FormEditorApi resolve(Class<?> supportClass) {
+            Method getFormEditor = method(supportClass, "getFormEditor", Object.class);
+            Class<?> editorClass = getFormEditor.getReturnType();
+            Method getFormModel = method(editorClass, "getFormModel", Object.class);
+            Class<?> modelClass = getFormModel.getReturnType();
+            return new FormEditorApi(
+                    method(supportClass, "isOpened", boolean.class),
+                    method(supportClass, "loadForm", null),
+                    method(supportClass, "reloadFormEditor", editorClass),
+                    getFormEditor,
+                    method(supportClass, "getDocument", Document.class),
+                    method(supportClass, "saveDocument", null),
+                    method(editorClass, "isFormLoaded", boolean.class),
+                    method(editorClass, "anyPersistenceError", boolean.class),
+                    getFormModel,
+                    method(editorClass, "regenerateCodeIfNeeded", null),
+                    method(editorClass, "closeForm", null),
+                    method(modelClass, "isReadOnly", boolean.class),
+                    method(modelClass, "fireFormChanged", null, boolean.class));
         }
-        return new Outcome(open, !before.equals(after), after);
+
+        /**
+         * Looks up a public method of a public class.
+         *
+         * @param returnType required return type, or {@code null} if the result is not used
+         */
+        private static Method method(Class<?> owner, String name, Class<?> returnType, Class<?>... paramTypes) {
+            Method method;
+            try {
+                method = owner.getMethod(name, paramTypes);
+            } catch (NoSuchMethodException e) {
+                throw unsupported(owner, name, "not found", e);
+            }
+            if (!Modifier.isPublic(method.getDeclaringClass().getModifiers())) {
+                throw unsupported(owner, name, "is not accessible", null);
+            }
+            if (returnType != null && !returnType.isAssignableFrom(method.getReturnType())) {
+                throw unsupported(owner, name, "returns " + method.getReturnType().getName(), null);
+            }
+            return method;
+        }
+    }
+
+    private static IllegalStateException unsupported(Class<?> owner, String methodName, String problem, Exception cause) {
+        return new IllegalStateException("Unsupported NetBeans form editor version: "
+                + owner.getName() + "." + methodName + "() " + problem, cause);
     }
 
     /** Returns the form module's {@code EditorSupport}, or {@code null} for a non-form data object. */
     private static Object formEditorSupport(DataObject dataObject) throws Exception {
+        Method getFormEditorSupport;
         try {
-            dataObject.getClass().getMethod("getFormEditorSupport");
+            getFormEditorSupport = dataObject.getClass().getMethod("getFormEditorSupport");
         } catch (NoSuchMethodException e) {
             return null;
         }
-        return call(dataObject, "getFormEditorSupport");
+        return invoke(getFormEditorSupport, dataObject);
     }
 
     /**
      * An unmodified open editor reloads on its own after an external change, but
      * asynchronously. Waits until it shows the content on disk so the regenerated
      * code is not merged into, and saved over, a stale document.
+     *
+     * <p>The comparison ignores whitespace (see {@link #documentMatchesDisk}), so an
+     * external edit that changed only whitespace counts as in sync; the form editor
+     * then regenerates into the document without that change. Polls with
+     * {@code Thread.sleep} and waits for the EDT, so it must never be called on the EDT.
      */
     private static void waitForDocumentInSync(EditorCookie editorCookie, FileObject javaFo, String javaName)
             throws Exception {
@@ -329,24 +423,12 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
         return text.get();
     }
 
-    /** Invokes a public no-arg method on an object of a non-API form module class. */
-    private static Object call(Object target, String methodName) throws Exception {
-        return call(target, methodName, null, null);
-    }
-
-    /** Invokes a public method with at most one parameter on an object of a non-API form module class. */
-    private static Object call(Object target, String methodName, Class<?> paramType, Object arg) throws Exception {
-        Method method;
+    /** Invokes a method of a non-API form module class, rethrowing what the method threw. */
+    private static Object invoke(Method method, Object target, Object... args) throws Exception {
         try {
-            method = paramType == null
-                    ? target.getClass().getMethod(methodName)
-                    : target.getClass().getMethod(methodName, paramType);
-        } catch (NoSuchMethodException e) {
-            throw new IllegalStateException("Unsupported NetBeans form editor version: "
-                    + target.getClass().getName() + "." + methodName + "() not found", e);
-        }
-        try {
-            return paramType == null ? method.invoke(target) : method.invoke(target, arg);
+            return method.invoke(target, args);
+        } catch (IllegalAccessException e) {
+            throw unsupported(target.getClass(), method.getName(), "is not accessible", e);
         } catch (InvocationTargetException e) {
             Throwable cause = e.getCause();
             if (cause instanceof Exception ex) {
