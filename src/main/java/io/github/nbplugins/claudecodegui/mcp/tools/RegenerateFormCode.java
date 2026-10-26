@@ -7,9 +7,15 @@ import java.io.FileNotFoundException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.swing.text.BadLocationException;
 import javax.swing.text.Document;
@@ -42,6 +48,14 @@ import org.openide.loaders.DataObject;
  * immediately ({@code true}); a queued one arrives after this EDT task. Since the
  * event marks the form modified, both files are saved like the IDE's Save does,
  * which re-serializes the {@code .form} file.
+ *
+ * <p>Event handler methods are not part of the regenerated code: the form editor writes
+ * a handler method only when an event handler is added to the form. So before marking
+ * the form changed, {@code FormModel.fireEventHandlerAdded()} is fired for each handler
+ * of the {@code .form} that has no {@code //GEN-FIRST:event_<handler>} section in the
+ * {@code .java} yet, as the GUI Builder does when the user adds an event. On the EDT
+ * these events are queued; {@code fireFormChanged(true)} delivers them in one batch,
+ * which generates the handler methods with the IDE's default body.
  */
 public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, String> {
 
@@ -54,6 +68,9 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
     private static final Pattern GUARD_MARKER = Pattern.compile("//GEN-[A-Z]+:\\S*");
 
     private static final Pattern WHITESPACE = Pattern.compile("\\s+");
+
+    /** Guarded header of an event handler method, capturing the handler name. */
+    private static final Pattern EVENT_HANDLER_HEADER = Pattern.compile("//GEN-FIRST:event_([\\w$]+)");
 
     /** Tool parameters. */
     public static class Params {
@@ -80,11 +97,12 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
     /**
      * Result of a regeneration in the form editor.
      *
-     * @param designerOpen  whether the GUI Builder designer was open
-     * @param codeChanged   whether the regenerated code differs from the previous code
-     * @param generatedText the {@code .java} document text after regeneration
+     * @param designerOpen   whether the GUI Builder designer was open
+     * @param codeChanged    whether the regenerated code differs from the previous code
+     * @param generatedText  the {@code .java} document text after regeneration
+     * @param addedHandlers  event handler methods that were missing in the {@code .java} and were generated
      */
-    record Outcome(boolean designerOpen, boolean codeChanged, String generatedText) {}
+    record Outcome(boolean designerOpen, boolean codeChanged, String generatedText, List<String> addedHandlers) {}
 
     /** Creates a new instance of this tool. */
     public RegenerateFormCode() {}
@@ -99,6 +117,8 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
              + "Swing form's .java file from its .form file, exactly as the NetBeans form editor does, "
              + "and save it. ALWAYS call this after creating or modifying a .form file "
              + "instead of editing the guarded sections in the .java file by hand. "
+             + "Event handler methods of the .form that are missing in the .java are generated "
+             + "with a TODO body (//GEN-FIRST/GEN-LAST guarded header and footer); existing handler bodies are kept. "
              + "NetBeans also re-saves the .form file in its own formatting. "
              + "Re-read both files afterwards before editing them again.";
     }
@@ -168,6 +188,22 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
     }
 
     /**
+     * Returns the names of the event handler methods that have a guarded
+     * {@code //GEN-FIRST:event_<handler>} header in the {@code .java} file.
+     *
+     * @param javaText content of the {@code .java} file on disk
+     * @return the handler names
+     */
+    static Set<String> existingEventHandlers(String javaText) {
+        Set<String> handlers = new HashSet<>();
+        Matcher matcher = EVENT_HANDLER_HEADER.matcher(javaText);
+        while (matcher.find()) {
+            handlers.add(matcher.group(1));
+        }
+        return handlers;
+    }
+
+    /**
      * Rejects files outside the open projects.
      * Protected so tests can bypass the open-projects lookup.
      *
@@ -199,7 +235,8 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
         formFo.refresh();
         javaFo.refresh();
 
-        if (!javaFo.asText().contains("//GEN-BEGIN:initComponents")) {
+        String javaText = javaFo.asText();
+        if (!javaText.contains("//GEN-BEGIN:initComponents")) {
             throw new IllegalStateException(javaName + " has no generated initComponents() guarded block "
                     + "(//GEN-BEGIN:initComponents ... //GEN-END:initComponents); the form editor cannot generate code into it");
         }
@@ -216,7 +253,8 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
         }
         waitForDocumentInSync(dataObject.getLookup().lookup(EditorCookie.class), javaFo, javaName);
 
-        Outcome outcome = onEdt(() -> regenerateInFormEditor(editorSupport, javaName, formName));
+        Set<String> existingHandlers = existingEventHandlers(javaText);
+        Outcome outcome = onEdt(() -> regenerateInFormEditor(editorSupport, javaName, formName, existingHandlers));
         String designerNote = outcome.designerOpen()
                 ? " The open GUI Builder was reloaded from the edited .form." : "";
         if (!outcome.codeChanged()) {
@@ -227,8 +265,11 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
             throw new IllegalStateException("The code was regenerated in the IDE but " + javaName
                     + " on disk was not updated. Ask the user to save it in the IDE.");
         }
+        String handlersNote = outcome.addedHandlers().isEmpty() ? ""
+                : " Added the missing event handler methods " + String.join(", ", outcome.addedHandlers())
+                        + " with a TODO body; write their code between the //GEN-FIRST and //GEN-LAST lines.";
         return "Regenerated initComponents() and the variables declaration of " + javaName
-                + " from " + formName + " and saved both files." + designerNote
+                + " from " + formName + " and saved both files." + handlersNote + designerNote
                 + " Re-read " + javaName + " and " + formName + " before editing them again.";
     }
 
@@ -247,13 +288,15 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
      * {@link FormEditorApi}). A form loaded only for the regeneration (designer closed)
      * is always closed again, also when the regeneration fails.
      *
-     * @param editorSupport the form module's {@code FormEditorSupport}
-     * @param javaName      name of the {@code .java} file, for messages
-     * @param formName      name of the {@code .form} file, for messages
+     * @param editorSupport    the form module's {@code FormEditorSupport}
+     * @param javaName         name of the {@code .java} file, for messages
+     * @param formName         name of the {@code .form} file, for messages
+     * @param existingHandlers event handler methods the {@code .java} already has (see {@link #existingEventHandlers})
      * @return what happened
      * @throws Exception if the form cannot be loaded or the code cannot be regenerated
      */
-    static Outcome regenerateInFormEditor(Object editorSupport, String javaName, String formName) throws Exception {
+    static Outcome regenerateInFormEditor(Object editorSupport, String javaName, String formName,
+                                          Set<String> existingHandlers) throws Exception {
         FormEditorApi api = FormEditorApi.resolve(editorSupport.getClass());
         boolean open = (Boolean) invoke(api.isOpened(), editorSupport);
         Object formEditor;
@@ -278,16 +321,50 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
             }
             Document document = (Document) invoke(api.getDocument(), editorSupport);
             String before = documentText(document);
+            List<String> addedHandlers = addMissingEventHandlers(api, formModel, existingHandlers);
+            // Also delivers the queued handler events, in the same batch.
             invoke(api.fireFormChanged(), formModel, true);
             invoke(api.regenerateCodeIfNeeded(), formEditor);
             String after = documentText(document);
             invoke(api.saveDocument(), editorSupport);
-            return new Outcome(open, !before.equals(after), after);
+            return new Outcome(open, !before.equals(after), after, addedHandlers);
         } finally {
             if (!open) {
                 invoke(api.closeForm(), formEditor);
             }
         }
+    }
+
+    /**
+     * Fires {@code FormModel.fireEventHandlerAdded(event, handler, null, null, true)} for
+     * each event handler of the form that the {@code .java} does not have yet - what the
+     * GUI Builder does when the user adds an event handler. On the EDT the form model
+     * queues these events; the code generator writes the handler methods (with the IDE's
+     * default body) when the next immediate event delivers the batch. Delivered in a batch,
+     * they also do not open the editor at the new handler, as a single added handler would.
+     * The form keeps its handlers in a hash map, so they are added sorted by name, which
+     * is also the order of the generated methods.
+     *
+     * @return the handlers that were added, sorted by name
+     */
+    private static List<String> addMissingEventHandlers(FormEditorApi api, Object formModel,
+                                                        Set<String> existingHandlers) throws Exception {
+        Object formEvents = invoke(api.getFormEvents(), formModel);
+        String[] handlers = (String[]) invoke(api.getAllEventHandlers(), formEvents);
+        Arrays.sort(handlers);
+        List<String> added = new ArrayList<>();
+        for (String handler : handlers) {
+            if (existingHandlers.contains(handler)) {
+                continue;
+            }
+            Object[] events = (Object[]) invoke(api.getEventsForHandler(), formEvents, handler);
+            if (events.length == 0) {
+                continue;
+            }
+            invoke(api.fireEventHandlerAdded(), formModel, events[0], handler, null, null, true);
+            added.add(handler);
+        }
+        return added;
     }
 
     private static IllegalStateException formLoadError(String formName) {
@@ -299,18 +376,23 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
      * The form module methods this tool invokes. They are all resolved, with their
      * return types checked, before any of them is called, so that an incompatible
      * NetBeans version fails with "Unsupported NetBeans form editor version" before
-     * the form is touched. The {@code FormEditor} and {@code FormModel} classes are
-     * taken from the declared return types of {@code getFormEditor()} and
-     * {@code getFormModel()}.
+     * the form is touched. The {@code FormEditor}, {@code FormModel}, {@code FormEvents}
+     * and {@code Event} classes are taken from the declared return types of
+     * {@code getFormEditor()}, {@code getFormModel()}, {@code getFormEvents()} and
+     * {@code getEventsForHandler()}.
      *
      * <p>Verified against NetBeans 31 ({@code org.netbeans.modules.nbform.FormEditorSupport},
-     * {@code org.netbeans.modules.form.FormEditor}, {@code org.netbeans.modules.form.FormModel}).
+     * {@code org.netbeans.modules.form.FormEditor}, {@code org.netbeans.modules.form.FormModel},
+     * {@code org.netbeans.modules.form.FormEvents}); exercised against the real form editor
+     * of the compile-time NetBeans version by {@code RegenerateFormCodeIT}.
      */
     record FormEditorApi(Method isOpened, Method loadForm, Method reloadFormEditor, Method getFormEditor,
                          Method getDocument, Method saveDocument,
                          Method isFormLoaded, Method anyPersistenceError, Method getFormModel,
                          Method regenerateCodeIfNeeded, Method closeForm,
-                         Method isReadOnly, Method fireFormChanged) {
+                         Method isReadOnly, Method fireFormChanged,
+                         Method getFormEvents, Method getAllEventHandlers, Method getEventsForHandler,
+                         Method fireEventHandlerAdded) {
 
         /**
          * Resolves the form module methods starting from the runtime class of the form editor support.
@@ -324,6 +406,10 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
             Class<?> editorClass = getFormEditor.getReturnType();
             Method getFormModel = method(editorClass, "getFormModel", Object.class);
             Class<?> modelClass = getFormModel.getReturnType();
+            Method getFormEvents = method(modelClass, "getFormEvents", Object.class);
+            Class<?> eventsClass = getFormEvents.getReturnType();
+            Method getEventsForHandler = method(eventsClass, "getEventsForHandler", Object[].class, String.class);
+            Class<?> eventClass = getEventsForHandler.getReturnType().getComponentType();
             return new FormEditorApi(
                     method(supportClass, "isOpened", boolean.class),
                     method(supportClass, "loadForm", null),
@@ -337,7 +423,12 @@ public class RegenerateFormCode implements Tool<RegenerateFormCode.Params, Strin
                     method(editorClass, "regenerateCodeIfNeeded", null),
                     method(editorClass, "closeForm", null),
                     method(modelClass, "isReadOnly", boolean.class),
-                    method(modelClass, "fireFormChanged", null, boolean.class));
+                    method(modelClass, "fireFormChanged", null, boolean.class),
+                    getFormEvents,
+                    method(eventsClass, "getAllEventHandlers", String[].class),
+                    getEventsForHandler,
+                    method(modelClass, "fireEventHandlerAdded", null,
+                            eventClass, String.class, String.class, String.class, boolean.class));
         }
 
         /**

@@ -89,6 +89,18 @@ public class RegenerateFormCodeTest {
     }
 
     @Test
+    public void findsExistingEventHandlersByTheirGuardedHeader() {
+        String javaText = "    private void jButton1ActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_jButton1ActionPerformed\n"
+                + "    }//GEN-LAST:event_jButton1ActionPerformed\n"
+                + "    private void my$Handler(java.awt.event.MouseEvent evt) {//GEN-FIRST:event_my$Handler\n"
+                + "    }//GEN-LAST:event_my$Handler\n"
+                + "    private void notGuarded(java.awt.event.ActionEvent evt) {\n"
+                + "    }\n";
+        assertEquals(java.util.Set.of("jButton1ActionPerformed", "my$Handler"),
+                RegenerateFormCode.existingEventHandlers(javaText));
+    }
+
+    @Test
     public void runChecksAccessToBothFilesBeforeRegenerating() throws Exception {
         createForm("MyFrame");
         List<File> checked = new ArrayList<>();

@@ -1,4 +1,4 @@
-- Added the `regenerate_form_code` MCP tool: after Claude edits a Swing form (`.form`), it can regenerate the form's code in the IDE instead of editing the generated code by hand
+- Added the `regenerate_form_code` MCP tool: after Claude edits a Swing form (`.form`), it can regenerate the form's code in the IDE, including new event handler methods, instead of editing the generated code by hand
 # 1.3.42 (2026-10-22)
 - Fixed OpenAI-compatible models with strict chat templates (e.g. vLLM behind LiteLLM) failing every request with "System message must be at the beginning"
 # 1.3.39 (2026-10-18)

@@ -1,5 +1,8 @@
 package io.github.nbplugins.claudecodegui.mcp.tools;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
 import javax.swing.text.BadLocationException;
 import javax.swing.text.Document;
 import javax.swing.text.PlainDocument;
@@ -20,7 +23,10 @@ import static org.junit.jupiter.api.Assertions.*;
  *       it immediately, {@code fireFormChanged(false)} queues it via invokeLater, i.e.
  *       after the caller's EDT task;</li>
  *   <li>a form change marks the form modified; {@code saveSourceOnly()} saves just the
- *       .java, {@code saveDocument()} saves .form and .java.</li>
+ *       .java, {@code saveDocument()} saves .form and .java;</li>
+ *   <li>{@code fireEventHandlerAdded()} is a modifying event too, so on the EDT it is
+ *       queued; the code generator writes the handler method when the next immediate
+ *       event delivers the pending events.</li>
  * </ul>
  */
 public class RegenerateFormCodeEditorTest {
@@ -28,15 +34,47 @@ public class RegenerateFormCodeEditorTest {
     private static final String OLD_CODE = "class MyFrame { /* old initComponents */ }";
     private static final String NEW_CODE = "class MyFrame { /* initComponents with jButton1 */ }";
 
+    /** Fake {@code Event}. */
+    public static class FakeEvent {
+    }
+
+    /** Fake {@code FormEvents}: the event handlers declared in the .form. */
+    public static class FakeFormEvents {
+        final List<String> handlers = new ArrayList<>();
+
+        public String[] getAllEventHandlers() { return handlers.toArray(new String[0]); }
+
+        public FakeEvent[] getEventsForHandler(String handler) {
+            return handlers.contains(handler) ? new FakeEvent[] {new FakeEvent()} : new FakeEvent[0];
+        }
+    }
+
     /** Fake {@code FormModel}. */
     public static class FakeFormModel {
         FakeFormEditor editor;
+        final FakeFormEvents events = new FakeFormEvents();
         boolean queuedEvent;
+        /** Handler-added events: queued on the EDT like other modifying events. */
+        final List<String> queuedHandlers = new ArrayList<>();
 
         public boolean isReadOnly() { return false; }
 
+        public FakeFormEvents getFormEvents() { return events; }
+
+        public Object fireEventHandlerAdded(FakeEvent event, String handler, String bodyText,
+                                           String annotationText, boolean createdNew) {
+            assertNotNull(event);
+            assertNull(bodyText, "the IDE's default handler body must be used");
+            assertTrue(createdNew);
+            queuedHandlers.add(handler);
+            return null;
+        }
+
         public Object fireFormChanged(boolean immediately) {
             if (immediately) {
+                // delivers the pending events in one batch
+                editor.generatedHandlers.addAll(queuedHandlers);
+                queuedHandlers.clear();
                 editor.codeUpToDate = false;
                 editor.support.formModified = true;
             } else {
@@ -55,6 +93,8 @@ public class RegenerateFormCodeEditorTest {
         boolean codeUpToDate = true; // JavaCodeGenerator's constructor default
         boolean failRegeneration;
         String generatedCode = NEW_CODE;
+        /** Handler methods written by the code generator when the handler-added events are delivered. */
+        final List<String> generatedHandlers = new ArrayList<>();
 
         FakeFormEditor(FakeEditorSupport support) {
             this.support = support;
@@ -74,6 +114,9 @@ public class RegenerateFormCodeEditorTest {
                 codeUpToDate = true;
                 support.document.remove(0, support.document.getLength());
                 support.document.insertString(0, generatedCode, null);
+                for (String handler : generatedHandlers) {
+                    support.document.insertString(support.document.getLength(), " handler:" + handler, null);
+                }
             }
         }
     }
@@ -115,7 +158,7 @@ public class RegenerateFormCodeEditorTest {
     public void designerClosedRegeneratesAndSavesJava() throws Exception {
         FakeEditorSupport support = new FakeEditorSupport(false);
 
-        RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form");
+        RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form", Set.of());
 
         assertEquals(NEW_CODE, support.savedJava,
                 "a freshly loaded form is considered up to date - the form must be marked changed "
@@ -128,7 +171,7 @@ public class RegenerateFormCodeEditorTest {
     public void designerOpenReloadsRegeneratesAndSavesJava() throws Exception {
         FakeEditorSupport support = new FakeEditorSupport(true);
 
-        RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form");
+        RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form", Set.of());
 
         assertTrue(support.reloaded, "an open designer must be reloaded from the edited .form");
         assertEquals(NEW_CODE, support.savedJava);
@@ -137,12 +180,38 @@ public class RegenerateFormCodeEditorTest {
     }
 
     @Test
+    public void generatesOnlyEventHandlersMissingInJava() throws Exception {
+        FakeEditorSupport support = new FakeEditorSupport(false);
+        support.formEditor.model.events.handlers.addAll(List.of("otherNewHandler", "existingHandler", "newHandler"));
+
+        RegenerateFormCode.Outcome outcome = RegenerateFormCode.regenerateInFormEditor(
+                support, "MyFrame.java", "MyFrame.form", Set.of("existingHandler"));
+
+        assertEquals(List.of("newHandler", "otherNewHandler"), outcome.addedHandlers(), "added sorted by name");
+        assertEquals(NEW_CODE + " handler:newHandler handler:otherNewHandler", support.savedJava,
+                "the queued handler events must be delivered before regenerating; an existing handler must not be re-added");
+        assertTrue(support.formEditor.model.queuedHandlers.isEmpty(), "no handler event may be left queued");
+    }
+
+    @Test
+    public void addsNoEventHandlersWhenAllExist() throws Exception {
+        FakeEditorSupport support = new FakeEditorSupport(true);
+        support.formEditor.model.events.handlers.add("existingHandler");
+
+        RegenerateFormCode.Outcome outcome = RegenerateFormCode.regenerateInFormEditor(
+                support, "MyFrame.java", "MyFrame.form", Set.of("existingHandler"));
+
+        assertEquals(List.of(), outcome.addedHandlers());
+        assertEquals(NEW_CODE, support.savedJava);
+    }
+
+    @Test
     public void reportsUnchangedCodeInsteadOfSuccess() throws Exception {
         FakeEditorSupport support = new FakeEditorSupport(false);
         support.formEditor.generatedCode = OLD_CODE;
 
         RegenerateFormCode.Outcome outcome =
-                RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form");
+                RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form", Set.of());
 
         assertFalse(outcome.codeChanged());
         assertEquals(OLD_CODE, outcome.generatedText());
@@ -154,7 +223,7 @@ public class RegenerateFormCodeEditorTest {
         support.formEditor.failRegeneration = true;
 
         IllegalStateException e = assertThrows(IllegalStateException.class,
-                () -> RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form"));
+                () -> RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form", Set.of()));
 
         assertEquals("code generation failed", e.getMessage());
         assertTrue(support.formEditor.closed, "a form loaded only for regeneration must be closed even on failure");
@@ -166,7 +235,7 @@ public class RegenerateFormCodeEditorTest {
         support.formEditor.failRegeneration = true;
 
         assertThrows(IllegalStateException.class,
-                () -> RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form"));
+                () -> RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form", Set.of()));
 
         assertFalse(support.formEditor.closed, "the user's open designer must not be closed");
     }
@@ -192,7 +261,7 @@ public class RegenerateFormCodeEditorTest {
         IncompatibleEditorSupport support = new IncompatibleEditorSupport();
 
         IllegalStateException e = assertThrows(IllegalStateException.class,
-                () -> RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form"));
+                () -> RegenerateFormCode.regenerateInFormEditor(support, "MyFrame.java", "MyFrame.form", Set.of()));
 
         assertTrue(e.getMessage().startsWith("Unsupported NetBeans form editor version"), e.getMessage());
         assertTrue(e.getMessage().contains("saveDocument"), e.getMessage());
@@ -208,7 +277,7 @@ public class RegenerateFormCodeEditorTest {
     @Test
     public void nonPublicClassIsReportedAsUnsupportedVersion() {
         IllegalStateException e = assertThrows(IllegalStateException.class,
-                () -> RegenerateFormCode.regenerateInFormEditor(new NonPublicEditorSupport(), "MyFrame.java", "MyFrame.form"));
+                () -> RegenerateFormCode.regenerateInFormEditor(new NonPublicEditorSupport(), "MyFrame.java", "MyFrame.form", Set.of()));
 
         assertTrue(e.getMessage().startsWith("Unsupported NetBeans form editor version"), e.getMessage());
         assertTrue(e.getMessage().contains("is not accessible"), e.getMessage());
