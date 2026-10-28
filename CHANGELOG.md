@@ -1,3 +1,4 @@
+- Added the `regenerate_form_code` MCP tool: after Claude edits a Swing form (`.form`), it can regenerate the form's code in the IDE, including new event handler methods, instead of editing the generated code by hand
 - Fixed the resume-session list being empty on Windows and for project paths containing characters such as `_` or `.`
 - Fixed Markdown preview of files with Windows (CRLF) line endings: lists and code blocks inside lists are now rendered instead of shown as plain text
 # 1.3.45 (2026-10-28)
